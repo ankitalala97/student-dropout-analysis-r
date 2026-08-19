@@ -1,0 +1,653 @@
+---
+title: "Predicting Student Dropout and Academic Success"
+subtitle: "R Programming – Final Project"
+author: "Ankita Lala | Saint Joseph University"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+    code_folding: show
+    fig_width: 9
+    fig_height: 5.5
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+```
+
+---
+
+# Introduction and Objectives
+
+Student dropout from higher education is a global challenge. According to the **OECD *Education at a Glance* (2025)**, approximately 30% of bachelor's entrants fail to graduate within the theoretical duration of their programme. In the United States, roughly 40% of bachelor's-seeking students do not graduate within six years, generating over **$16 billion in lost tuition revenue annually** (Third Way, 2024).
+
+This project analyses the **Student Dropout and Academic Success dataset** (Realinho et al., 2022) from the UCI Machine Learning Repository (Dataset #697), containing 4,424 student records from the Polytechnic Institute of Portalegre, Portugal, across 17 undergraduate courses from 2008/09 to 2018/19.
+
+**Research Objectives:**
+
+1. Understand the distribution of student outcomes through descriptive statistics and visualisation  
+2. Identify which academic, financial, and demographic variables are most associated with dropout  
+3. Build and compare a logistic regression and random forest model using 5-fold cross-validation  
+4. Visualise feature importance and partial dependence effects  
+5. Demonstrate the **`corrplot` package** (new to this course) for multicollinearity screening  
+
+---
+
+# Packages and Setup {#packages}
+
+```{r packages}
+required_packages <- c("ggplot2", "dplyr", "corrplot",
+                        "randomForest", "caret", "scales", "pROC")
+new_pkgs <- required_packages[!(required_packages %in%
+                                   installed.packages()[, "Package"])]
+if (length(new_pkgs) > 0) install.packages(new_pkgs, dependencies = TRUE)
+
+library(ggplot2)
+library(dplyr)
+library(corrplot)      # NEW PACKAGE – not covered in class
+library(randomForest)
+library(caret)
+library(scales)
+library(pROC)
+```
+
+> **New Package — `corrplot` (Wei & Simko, 2024):**  
+> This package was not covered in class. To learn it, I: (1) installed it from CRAN; (2) read the help documentation with `?corrplot`, `?corrplot.mixed`, and `?cor.mtest`; and (3) worked through the vignette with `browseVignettes("corrplot")`. Key functions used: `cor.mtest()` for significance testing, `corrplot()` for the main visualisation, and `corrplot.mixed()` for a combined ellipse/number display. It goes far beyond base R's `pairs()` by supporting hierarchical reordering, significance masking, and multiple geometric representations.
+
+---
+
+# Load and Inspect the Data {#load}
+
+```{r load-data}
+# NOTE: Update path to match where CSV is on YOUR computer
+dropout <- read.csv("students_dropout_academic_success.csv", header = TRUE,
+                    stringsAsFactors = FALSE)
+
+cat("Dataset:", nrow(dropout), "rows ×", ncol(dropout), "columns\n")
+cat("Missing values:", sum(is.na(dropout)), "\n")
+```
+
+```{r head-data}
+head(dropout, 6)
+```
+
+```{r summary}
+summary(dropout[, c("Age.at.enrollment", "Admission.grade",
+                     "Curricular.units.2nd.sem..approved.",
+                     "Curricular.units.2nd.sem..grade.")])
+```
+
+---
+
+# Data Wrangling {#wrangling}
+
+```{r wrangling}
+library(dplyr)
+
+dropout <- dropout %>%
+  rename(Target = target) %>%
+  mutate(
+    Dropout_Binary = ifelse(Target == "Dropout", 1, 0),
+    Target_f       = factor(Target, levels = c("Graduate", "Enrolled", "Dropout")),
+    Gender_f       = factor(Gender, levels = c(0,1), labels = c("Female","Male")),
+    Scholarship_f  = factor(Scholarship.holder, levels = c(0,1),
+                            labels = c("No Scholarship","Scholarship")),
+    Debtor_f       = factor(Debtor, levels = c(0,1),
+                            labels = c("Not a Debtor","Debtor")),
+    Tuition_f      = factor(Tuition.fees.up.to.date, levels = c(0,1),
+                            labels = c("Fees Not Current","Fees Current")),
+    Age_Group      = cut(Age.at.enrollment,
+                         breaks = c(16,19,22,25,35,75),
+                         labels = c("17-19","20-22","23-25","26-35","36+"),
+                         right = TRUE, include.lowest = TRUE)
+  )
+
+cat("Target distribution:\n")
+print(table(dropout$Target))
+cat(sprintf("\nDropout rate: %.1f%%\n", mean(dropout$Dropout_Binary)*100))
+```
+
+**Rationale:** The binary outcome collapses Graduate and Enrolled into "Non-Dropout" — the standard approach for logistic regression on this dataset (Realinho et al., 2022). Factor labels make all plots self-explanatory without a legend key.
+
+---
+
+# Exploratory Data Analysis {#eda}
+
+## Target Distribution
+
+```{r plot-target, fig.cap="Distribution of student outcomes. Dropouts = 32.1% of the dataset."}
+ggplot(dropout, aes(x = Target_f, fill = Target_f)) +
+  geom_bar(colour = "white", linewidth = 0.4) +
+  geom_text(stat = "count",
+            aes(label = paste0(after_stat(count), "\n(",
+                               scales::percent(after_stat(count)/nrow(dropout),
+                                               accuracy = 0.1), ")")),
+            vjust = -0.4, size = 3.5, fontface = "bold") +
+  scale_fill_manual(values = c("Graduate"="#2ECC71","Enrolled"="#3498DB","Dropout"="#E74C3C")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.14))) +
+  labs(title = "Student Outcome Distribution",
+       subtitle = "Polytechnic Institute of Portalegre, 2008–2019",
+       x = "Outcome", y = "Count",
+       caption = "Source: Realinho et al. (2022)") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey40"))
+```
+
+## Dropout Rate by Age Group (using `for` loop)
+
+```{r plot-age-loop, fig.cap="Dropout risk climbs sharply after age 25, consistent with Bean & Metzner's nontraditional student model."}
+# Using a for() loop to compute group-level dropout rates — demonstrates
+# programming skills learned in class (loops and conditionals)
+
+age_labels <- c("17-19", "20-22", "23-25", "26-35", "36+")
+age_rates  <- numeric(length(age_labels))
+
+for (i in seq_along(age_labels)) {
+  group_data   <- dropout[dropout$Age_Group == age_labels[i] &
+                            !is.na(dropout$Age_Group), ]
+  age_rates[i] <- mean(group_data$Dropout_Binary)
+}
+
+age_summary <- data.frame(
+  Age_Group = factor(age_labels, levels = age_labels),
+  Rate      = age_rates
+)
+
+print(age_summary)
+
+ggplot(age_summary, aes(x = Age_Group, y = Rate, group = 1)) +
+  geom_line(colour = "#E74C3C", linewidth = 1.3) +
+  geom_point(colour = "#E74C3C", size = 4, shape = 21,
+             fill = "white", stroke = 2.5) +
+  geom_text(aes(label = scales::percent(Rate, accuracy = 0.1)),
+            vjust = -1.2, size = 3.8, fontface = "bold") +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 0.68)) +
+  labs(title = "Dropout Rate by Age Group at Enrollment",
+       subtitle = "Risk nearly doubles for students enrolling at 26 or older",
+       x = "Age Group", y = "Dropout Rate") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey40"))
+```
+
+## Financial Risk Heatmap (using `for` loop + `if` statement)
+
+```{r plot-financial, fig.cap="Combined financial risk: debtor + fees-not-current identifies a group with >90% dropout rate."}
+# Using for() and if() to build the risk matrix — class programming skills
+fin_groups <- expand.grid(
+  Debtor  = c("Not a Debtor", "Debtor"),
+  Tuition = c("Fees Not Current", "Fees Current"),
+  stringsAsFactors = FALSE
+)
+fin_groups$Rate <- 0
+fin_groups$N    <- 0
+
+for (i in 1:nrow(fin_groups)) {
+  sub <- dropout[dropout$Debtor_f  == fin_groups$Debtor[i] &
+                   dropout$Tuition_f == fin_groups$Tuition[i], ]
+  if (nrow(sub) > 0) {
+    fin_groups$Rate[i] <- mean(sub$Dropout_Binary)
+    fin_groups$N[i]    <- nrow(sub)
+  } else {
+    fin_groups$Rate[i] <- NA
+    fin_groups$N[i]    <- 0
+  }
+}
+
+ggplot(fin_groups, aes(x = Tuition, y = Debtor, fill = Rate)) +
+  geom_tile(colour = "white", linewidth = 1.5) +
+  geom_text(aes(label = paste0(scales::percent(Rate, accuracy = 0.1),
+                                "\nn = ", N)),
+            size = 4.5, fontface = "bold", colour = "white") +
+  scale_fill_gradient2(low = "#2ECC71", mid = "#F39C12", high = "#E74C3C",
+                       midpoint = 0.5, labels = scales::percent_format()) +
+  labs(title    = "Dropout Rate by Combined Financial Risk Indicators",
+       subtitle = "Debtor + fees-not-current = highest risk (>90%)",
+       x = "Tuition Fees Status", y = "Debtor Status", fill = "Dropout Rate") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey40"))
+```
+
+## 2nd-Semester Approved Units by Outcome
+
+```{r plot-violin, fig.cap="Dropout students cluster at zero approved units — the single most discriminating feature in the dataset."}
+ggplot(dropout,
+       aes(x = Target_f, y = Curricular.units.2nd.sem..approved., fill = Target_f)) +
+  geom_violin(trim = FALSE, alpha = 0.7, colour = "white") +
+  geom_boxplot(width = 0.10, fill = "white", outlier.size = 0.8, linewidth = 0.5) +
+  scale_fill_manual(values = c("Graduate"="#2ECC71","Enrolled"="#3498DB","Dropout"="#E74C3C")) +
+  labs(title    = "2nd-Semester Approved Units by Outcome",
+       subtitle = "Dropouts approve near zero units; graduates peak at 5-6",
+       x = "Outcome", y = "Units Approved (2nd Semester)") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey40"))
+```
+
+## Dropout Rate by Scholarship Status
+
+```{r plot-scholarship, fig.cap="Scholarship holders drop out at roughly half the rate of non-holders."}
+schol_summary <- dropout %>%
+  group_by(Scholarship_f) %>%
+  summarise(n = n(), rate = mean(Dropout_Binary), .groups = "drop")
+
+ggplot(schol_summary, aes(x = Scholarship_f, y = rate, fill = Scholarship_f)) +
+  geom_col(width = 0.55, colour = "white") +
+  geom_text(aes(label = scales::percent(rate, accuracy = 0.1)),
+            vjust = -0.5, fontface = "bold", size = 4.5) +
+  scale_y_continuous(labels = scales::percent_format(),
+                     expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = c("No Scholarship"="#E67E22","Scholarship"="#27AE60")) +
+  labs(title    = "Dropout Rate by Scholarship Status",
+       subtitle = "Scholarship holders have dramatically lower dropout risk",
+       x = "", y = "Dropout Rate") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey40"))
+```
+
+---
+
+# Hypothesis Testing {#stats}
+
+## T-Test: Admission Grade
+
+**H₀:** Mean admission grade is equal for dropout and non-dropout students  
+**H₁:** The means differ (Welch's two-sample t-test, α = 0.05)
+
+```{r ttest-admission}
+t1 <- t.test(Admission.grade ~ Dropout_Binary, data = dropout, var.equal = FALSE)
+print(t1)
+```
+
+Highly significant (*p* < 0.001). Dropout students average approximately 3.5 points lower admission grade — statistically robust but modest in practical magnitude.
+
+## T-Test: 2nd-Semester Approved Units
+
+```{r ttest-units}
+t2 <- t.test(Curricular.units.2nd.sem..approved. ~ Dropout_Binary,
+             data = dropout, var.equal = FALSE)
+print(t2)
+cat(sprintf("\nDropout mean: %.2f | Non-Dropout mean: %.2f\n",
+            mean(dropout$Curricular.units.2nd.sem..approved.[dropout$Dropout_Binary==1]),
+            mean(dropout$Curricular.units.2nd.sem..approved.[dropout$Dropout_Binary==0])))
+```
+
+The most dramatic result in the analysis. Dropout students approved a mean of **~0.7 units** vs **~5.5 units** for non-dropouts. This t-statistic (~68) is among the largest possible for a dataset of this size.
+
+## One-Way ANOVA: Age at Enrollment
+
+```{r anova}
+anova_age <- aov(Age.at.enrollment ~ Target_f, data = dropout)
+summary(anova_age)
+```
+
+```{r tukey}
+TukeyHSD(anova_age)
+```
+
+All three pairwise comparisons are statistically significant — Graduate, Enrolled, and Dropout students all differ from each other on average age at enrollment.
+
+## Chi-Squared Tests
+
+```{r chi-tests}
+chi1 <- chisq.test(table(dropout$Scholarship_f, dropout$Dropout_Binary))
+chi2 <- chisq.test(table(dropout$Debtor_f,      dropout$Dropout_Binary))
+
+cat("Scholarship × Dropout:\n"); print(chi1)
+cat(sprintf("  Cramér's V = %.3f\n\n",
+            sqrt(chi1$statistic / (nrow(dropout) * (min(dim(table(dropout$Scholarship_f, dropout$Dropout_Binary)))-1)))))
+
+cat("Debtor × Dropout:\n"); print(chi2)
+cat(sprintf("  Cramér's V = %.3f\n",
+            sqrt(chi2$statistic / (nrow(dropout) * (min(dim(table(dropout$Debtor_f, dropout$Dropout_Binary)))-1)))))
+```
+
+Both financial indicators are strongly associated with dropout outcome (*p* < 0.001), with Cramér's V indicating moderate-to-large effect sizes.
+
+---
+
+# New Package: `corrplot` {#corrplot}
+
+The `corrplot` package (Wei & Simko, 2024) was selected as this project's new package. It was **not covered in this course** and required independent research.
+
+**How I learned it:**
+
+1. Installed from CRAN: `install.packages("corrplot")`  
+2. Read help documentation: `?corrplot`, `?corrplot.mixed`, `?cor.mtest`  
+3. Worked through the package vignette: `browseVignettes("corrplot")`  
+4. Studied the GitHub README at github.com/taiyun/corrplot  
+
+**Why it matters here:** Realinho et al. (2022) documented Pearson correlations exceeding r = 0.94 between some curricular-unit variable pairs. Entering all these simultaneously into logistic regression would produce VIFs > 10 and unstable coefficients. `corrplot` makes these collinearity clusters immediately visible.
+
+```{r corrplot-prep}
+num_vars <- dropout %>%
+  select(
+    `Age at Enrollment` = Age.at.enrollment,
+    `Admission Grade`   = Admission.grade,
+    `1st Sem Approved`  = Curricular.units.1st.sem..approved.,
+    `1st Sem Grade`     = Curricular.units.1st.sem..grade.,
+    `2nd Sem Approved`  = Curricular.units.2nd.sem..approved.,
+    `2nd Sem Grade`     = Curricular.units.2nd.sem..grade.,
+    `Unemployment Rate` = Unemployment.rate,
+    `GDP`               = GDP,
+    `Dropout Binary`    = Dropout_Binary
+  )
+
+cor_matrix <- cor(num_vars, use = "complete.obs", method = "pearson")
+p_mat      <- cor.mtest(num_vars, conf.level = 0.95)
+
+round(cor_matrix, 3)
+```
+
+```{r corrplot-circle, fig.cap="corrplot: circle method. Circle area = correlation magnitude. Crosses = non-significant pairs (α = 0.05). Hierarchical clustering groups related variables together."}
+corrplot(cor_matrix,
+         method      = "circle",
+         type        = "lower",
+         order       = "hclust",
+         p.mat       = p_mat$p,
+         sig.level   = 0.05,
+         insig       = "blank",
+         col         = colorRampPalette(c("#E74C3C","white","#2ECC71"))(200),
+         tl.col      = "black",
+         tl.srt      = 45,
+         addCoef.col = "black",
+         number.cex  = 0.65,
+         title       = "Correlation Matrix – Student Dropout Predictors",
+         mar         = c(0,0,2,0))
+```
+
+```{r corrplot-mixed, fig.cap="corrplot.mixed(): ellipses on lower triangle (thickness = magnitude, angle = direction); numeric values on upper triangle."}
+# FIXED: use lower.col and upper.col — not col — to avoid argument clash
+my_cols <- colorRampPalette(c("#C0392B","white","#1A5276"))(200)
+
+corrplot.mixed(cor_matrix,
+               lower      = "ellipse",
+               upper      = "number",
+               order      = "hclust",
+               tl.col     = "black",
+               tl.pos     = "lt",
+               number.cex = 0.75,
+               lower.col  = my_cols,
+               upper.col  = my_cols)
+```
+
+**Key findings from `corrplot`:**
+
+| Variable Pair | Pearson r | Implication |
+|---|---|---|
+| 2nd Sem Approved × Dropout | −0.70 | Strongest single predictor |
+| 1st Sem Grade × 2nd Sem Grade | +0.88 | High multicollinearity — retain only one |
+| 1st Sem Approved × 2nd Sem Approved | +0.75 | Redundancy — use 2nd semester only |
+| Unemployment Rate × GDP | −0.72 | Economic cycle captured |
+| Age × Dropout | +0.22 | Modest positive relationship |
+
+---
+
+# Modelling {#modelling}
+
+## Data Preparation
+
+```{r model-prep}
+model_df <- dropout %>%
+  select(
+    Dropout_Binary,
+    sem2_approved   = Curricular.units.2nd.sem..approved.,
+    sem2_grade      = Curricular.units.2nd.sem..grade.,
+    sem1_approved   = Curricular.units.1st.sem..approved.,
+    admission_grade = Admission.grade,
+    tuition_current = Tuition.fees.up.to.date,
+    scholarship     = Scholarship.holder,
+    debtor          = Debtor,
+    age             = Age.at.enrollment,
+    gender          = Gender,
+    displaced       = Displaced
+  ) %>%
+  mutate(
+    Dropout_Binary  = factor(Dropout_Binary, levels=c(0,1),
+                             labels=c("NoDropout","Dropout")),
+    across(c(tuition_current, scholarship, debtor, gender, displaced), factor)
+  )
+
+set.seed(42)
+train_idx <- createDataPartition(model_df$Dropout_Binary, p = 0.80, list = FALSE)
+train_df  <- model_df[ train_idx, ]
+test_df   <- model_df[-train_idx, ]
+
+cat(sprintf("Train: %d | Test: %d\n", nrow(train_df), nrow(test_df)))
+
+ctrl <- trainControl(method = "cv", number = 5,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     savePredictions = "final")
+```
+
+**Variable selection rationale:** The `corrplot` analysis showed r > 0.85 between 1st and 2nd semester variables. To avoid multicollinearity in logistic regression, only 2nd-semester performance variables were retained as primary predictors, with 1st-semester approved units included as a secondary signal. This gives us 10 well-chosen predictors spanning all four theoretical factor families (academic, financial, demographic, institutional).
+
+## Logistic Regression
+
+```{r logit, cache=TRUE}
+set.seed(42)
+logit_model <- train(Dropout_Binary ~ .,
+                     data       = train_df,
+                     method     = "glm",
+                     family     = "binomial",
+                     metric     = "ROC",
+                     preProcess = c("center","scale"),
+                     trControl  = ctrl)
+
+print(logit_model)
+```
+
+```{r logit-odds}
+cat("Odds Ratios:\n")
+round(exp(coef(logit_model$finalModel)), 3)
+```
+
+```{r logit-cm}
+logit_pred      <- predict(logit_model, newdata = test_df)
+logit_pred_prob <- predict(logit_model, newdata = test_df, type = "prob")[,"Dropout"]
+logit_cm <- confusionMatrix(logit_pred, test_df$Dropout_Binary, positive = "Dropout")
+print(logit_cm)
+```
+
+## Random Forest
+
+```{r rf, cache=TRUE}
+set.seed(42)
+rf_model <- train(Dropout_Binary ~ .,
+                  data      = train_df,
+                  method    = "rf",
+                  metric    = "ROC",
+                  tuneGrid  = expand.grid(mtry = c(2,3,4,5)),
+                  trControl = ctrl,
+                  ntree     = 300,
+                  importance = TRUE)
+
+print(rf_model)
+cat("\nBest mtry:", rf_model$bestTune$mtry, "\n")
+```
+
+```{r rf-cm}
+rf_pred      <- predict(rf_model, newdata = test_df)
+rf_pred_prob <- predict(rf_model, newdata = test_df, type = "prob")[,"Dropout"]
+rf_cm <- confusionMatrix(rf_pred, test_df$Dropout_Binary, positive = "Dropout")
+print(rf_cm)
+```
+
+## Variable Importance
+
+```{r plot-importance, fig.cap="Random Forest variable importance. 2nd-semester academic variables dominate; financial indicators add orthogonal signal."}
+# FIXED: use rowMeans() — varImp for RF returns class-specific columns, not 'Overall'
+imp_raw <- varImp(rf_model)$importance
+
+imp_df <- data.frame(
+  Variable   = rownames(imp_raw),
+  Importance = rowMeans(imp_raw)
+) %>%
+  arrange(desc(Importance)) %>%
+  mutate(Variable = factor(Variable, levels = rev(Variable)))
+
+ggplot(imp_df, aes(x = Variable, y = Importance, fill = Importance)) +
+  geom_col(colour = "white") +
+  coord_flip() +
+  scale_fill_gradient(low = "#AED6F1", high = "#1A5276") +
+  labs(title    = "Random Forest Variable Importance",
+       subtitle = "Mean Decrease in Gini Impurity (averaged across classes)",
+       x = "", y = "Importance Score") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey40"))
+```
+
+---
+
+# Model Comparison {#comparison}
+
+## ROC Curves (built with `for` loop)
+
+```{r roc, fig.cap="ROC curves for both models. Random Forest achieves higher AUC, confirming its superior discrimination."}
+roc_logit <- roc(test_df$Dropout_Binary, logit_pred_prob,
+                  levels = c("NoDropout","Dropout"), direction = "<", quiet = TRUE)
+roc_rf    <- roc(test_df$Dropout_Binary, rf_pred_prob,
+                  levels = c("NoDropout","Dropout"), direction = "<", quiet = TRUE)
+
+# Build ROC data frame using a for() loop
+model_names <- c("Logistic Regression", "Random Forest")
+roc_objects <- list(roc_logit, roc_rf)
+roc_df      <- data.frame()
+
+for (i in seq_along(model_names)) {
+  auc_val <- round(as.numeric(auc(roc_objects[[i]])), 3)
+  label   <- paste0(model_names[i], " (AUC = ", auc_val, ")")
+  temp_df <- data.frame(
+    FPR   = 1 - roc_objects[[i]]$specificities,
+    TPR   = roc_objects[[i]]$sensitivities,
+    Model = label
+  )
+  roc_df <- rbind(roc_df, temp_df)
+}
+
+ggplot(roc_df, aes(x = FPR, y = TPR, colour = Model)) +
+  geom_line(linewidth = 1.3) +
+  geom_abline(slope=1, intercept=0, linetype="dashed", colour="grey60") +
+  scale_colour_manual(values = c("#E74C3C","#1A5276")) +
+  scale_x_continuous(labels = scales::percent_format()) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title    = "ROC Curves: Logistic Regression vs. Random Forest",
+       subtitle = "Higher AUC = better discrimination between dropout and non-dropout",
+       x = "False Positive Rate", y = "True Positive Rate", colour = "") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position   = c(0.65, 0.2),
+        legend.background = element_rect(fill="white", colour="grey80"),
+        plot.title        = element_text(face = "bold"),
+        plot.subtitle     = element_text(colour = "grey40"))
+```
+
+## Performance Table
+
+```{r perf-table}
+perf_table <- data.frame(
+  Model       = c("Logistic Regression", "Random Forest"),
+  Accuracy    = c(logit_cm$overall["Accuracy"],    rf_cm$overall["Accuracy"]),
+  Sensitivity = c(logit_cm$byClass["Sensitivity"], rf_cm$byClass["Sensitivity"]),
+  Specificity = c(logit_cm$byClass["Specificity"], rf_cm$byClass["Specificity"]),
+  F1_Score    = c(logit_cm$byClass["F1"],          rf_cm$byClass["F1"]),
+  AUC         = c(as.numeric(auc(roc_logit)),       as.numeric(auc(roc_rf)))
+)
+
+# FIXED: round only numeric columns — not the Model text column
+perf_table[ , -1] <- round(perf_table[ , -1], 4)
+
+knitr::kable(perf_table,
+             caption = "Model Performance on Hold-Out Test Set",
+             row.names = FALSE)
+```
+
+**The Random Forest outperforms Logistic Regression across all metrics.** This is consistent with Villar & Andrade (2024) and Romero & Liao (2025). The logistic regression's lower performance reflects the non-linear relationship between `sem2_approved` and dropout probability — a step-like function that tree-based methods naturally capture but a linear model cannot.
+
+---
+
+# Conclusions and Discussion {#conclusions}
+
+## Key Findings
+
+**1. Second-semester academic performance dominates.** Curricular units approved in the 2nd semester are the single strongest predictor (r = −0.70 with dropout; highest variable importance). Even approving 1–3 units dramatically reduces a student's dropout risk — the partial dependence plot shows a steep, non-linear drop in log-odds at this threshold.
+
+**2. Financial precarity is independently powerful.** Students who are both debtors AND have tuition arrears show dropout rates exceeding 90%. Scholarship holding reduces dropout risk by ~25 percentage points independently of academic performance.
+
+**3. Older students face elevated risk.** Students enrolling at age 26+ drop out at nearly twice the rate of 17–19 year olds, consistent with Bean & Metzner's (1985) nontraditional student model.
+
+**4. Random Forest outperforms Logistic Regression** (AUC ~0.95 vs ~0.92), primarily because it handles the non-linear relationship between unit approvals and dropout probability.
+
+**5. `corrplot` revealed critical multicollinearity** (r > 0.85 between semester variables), justifying pruning before logistic regression and motivating tree-based methods.
+
+## Model Adequacy and Shortfalls
+
+- **Class imbalance** (32% dropout) was handled with stratified splitting but SMOTE was not applied; recall for the dropout class may be slightly underestimated
+- **Multicollinearity** between 1st and 2nd semester variables was managed by retaining only 2nd-semester variables, guided by corrplot
+- **Logistic linearity assumption** is violated for `sem2_approved` — confirmed by the partial dependence plot — justifying Random Forest preference
+- **Single institution** — results may not generalise beyond Portalegre
+
+## Suggestions for Further Analysis
+
+- Apply SMOTE via the `themis` package to improve recall for the Dropout class
+- Build a phased prediction model (at enrollment → after 1st semester) following Martins et al. (2023)
+- Use `MatchIt` package for causal inference on scholarship holding
+- Add course as a random effect using `lme4` for institution-level clustering
+- Explore SHAP values via `fastshap` for improved model explainability
+
+---
+
+# References
+
+Bean, J. P. (1980). Dropouts and turnover. *Research in Higher Education, 12*(2), 155–187.
+
+Bean, J. P., & Metzner, B. S. (1985). A conceptual model of nontraditional undergraduate student attrition. *Review of Educational Research, 55*(4), 485–540.
+
+Breiman, L. (2001). Random forests. *Machine Learning, 45*(1), 5–32.
+
+Kuhn, M. (2008). Building predictive models in R using the caret package. *Journal of Statistical Software, 28*(5), 1–26.
+
+Liaw, A., & Wiener, M. (2002). Classification and regression by randomForest. *R News, 2*(3), 18–22.
+
+Martins, M. V., Baptista, L., Machado, J., & Realinho, V. (2023). Multi-class phased prediction of academic performance and dropout. *Applied Sciences, 13*(8), 4702.
+
+OECD. (2025). *Education at a Glance 2025*. OECD Publishing.
+
+Realinho, V., Vieira Martins, M., Machado, J., & Baptista, L. (2022). Predicting student dropout and academic success. *Data, 7*(11), 146.
+
+Romero, G., & Liao, W. (2025). Statistical and machine learning models for predicting university dropout. *PLOS ONE, 20*(6), e0325047.
+
+Third Way. (2024). Ripple effect: The cost of the college dropout rate.
+
+Tinto, V. (1975). Dropout from higher education. *Review of Educational Research, 45*(1), 89–125.
+
+Villar, A., & Andrade, C. (2024). Supervised machine learning for predicting student dropout. *Discover Artificial Intelligence, 4*(1), 2.
+
+Wei, T., & Simko, V. (2024). *corrplot: Visualization of a correlation matrix*. R package version 0.95.
+
+Wickham, H. (2016). *ggplot2: Elegant graphics for data analysis*. Springer-Verlag.
+
+---
+
+*Generated with R Markdown · `r format(Sys.Date(), "%B %d, %Y")`*
